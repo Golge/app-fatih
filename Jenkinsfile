@@ -16,6 +16,17 @@ pipeline {
     }
 
     stages {
+
+        stage('Tool Check') {
+            steps {
+                sh '''
+                    echo "Java: $(which java)"
+                    echo "Maven: $(which mvn)"
+                    echo "Docker: $(which docker)"
+                '''
+            }
+        }
+        
         stage('Checkout') {
             steps {
                 cleanWs()

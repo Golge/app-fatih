@@ -1,0 +1,369 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+  workflow_dispatch:
+
+env:
+  HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+  HARBOR_PROJECT: javdes
+  IMAGE_NAME: app-javdes
+  JAVA_VERSION: '17'
+  MAVEN_VERSION: '3.9.6'
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Shallow clones should be disabled for better analysis
+    
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        
+    - name: Cache Maven dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+        
+    - name: Build with Maven
+      run: |
+        mvn clean compile -B
+        
+    - name: Run Tests
+      run: |
+        mvn test -B
+        
+    - name: Package Application
+      run: |
+        mvn package -DskipTests=true -B
+        
+    - name: Upload Test Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: |
+          target/surefire-reports/
+          target/*.jar
+          
+  sonarqube-analysis:
+    name: SonarQube Analysis
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        
+    - name: Cache Maven dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+        
+    - name: Build and analyze with SonarQube
+      env:
+        GITHUB_TOKEN: ${{ secrets.GHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      run: |
+        # If using SonarCloud (recommended)
+        if [ ! -z "$SONAR_TOKEN" ]; then
+          mvn clean verify sonar:sonar \
+            -Dsonar.projectKey=Golge_app-fatih \
+            -Dsonar.organization=golge \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token=$SONAR_TOKEN
+        else
+          # Fallback: Run SonarQube in Docker (local analysis)
+          echo "Running SonarQube analysis locally..."
+          mvn clean compile test
+          
+          docker run --rm \
+            -v "${PWD}:/usr/src" \
+            -w /usr/src \
+            sonarsource/sonar-scanner-cli:latest \
+            sonar-scanner \
+              -Dsonar.projectKey=app-javdes \
+              -Dsonar.projectName="App JavaDes" \
+              -Dsonar.sources=src/main/java \
+              -Dsonar.tests=src/test/java \
+              -Dsonar.java.binaries=target/classes \
+              -Dsonar.java.test.binaries=target/test-classes \
+              -Dsonar.junit.reportPaths=target/surefire-reports \
+              -Dsonar.working.directory=.scannerwork
+        fi
+        
+    - name: Upload SonarQube Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: sonarqube-results
+        path: |
+          .scannerwork/
+          target/sonar/
+          
+  build-and-push-image:
+    name: Build and Push Docker Image
+    needs: [build-and-test, sonarqube-analysis]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        
+    - name: Cache Maven dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+        
+    - name: Build Application
+      run: |
+        mvn clean package -DskipTests=true -B
+        
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Login to Harbor Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ secrets.HARBOR_REGISTRY }}
+        username: ${{ secrets.HARBOR_USERNAME }}
+        password: ${{ secrets.HARBOR_PASSWORD }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=raw,value=${{ github.run_number }}
+          
+    - name: Build and Push Docker Image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ secrets.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}
+        format: spdx-json
+        output-file: sbom.spdx.json
+        
+    - name: Upload SBOM
+      uses: actions/upload-artifact@v4
+      with:
+        name: sbom
+        path: sbom.spdx.json
+        
+  security-scan:
+    name: Security Scan
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ secrets.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+  update-manifests:
+    name: Update Kubernetes Manifests
+    needs: [build-and-push-image, security-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: Checkout Manifests Repository
+      uses: actions/checkout@v4
+      with:
+        repository: Golge/app-fatih-manifests
+        token: ${{ secrets.GHUB_TOKEN }}
+        path: manifests
+        
+    - name: Update Deployment Manifest
+      run: |
+        cd manifests
+        
+        # Update the image tag in deployment.yaml
+        NEW_IMAGE="${{ secrets.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}"
+        
+        if [ -f "k8s-manifests/app/base/deployment.yaml" ]; then
+          sed -i "s|image:.*app-javdes:.*|image: ${NEW_IMAGE}|g" k8s-manifests/app/base/deployment.yaml
+          echo "✅ Updated deployment.yaml with image: ${NEW_IMAGE}"
+          
+          # Show the changes
+          echo "=== Changes made ==="
+          git diff k8s-manifests/app/base/deployment.yaml
+        else
+          echo "❌ Deployment manifest not found"
+          find . -name "*.yaml" -o -name "*.yml" | head -10
+          exit 1
+        fi
+        
+    - name: Commit and Push Changes
+      run: |
+        cd manifests
+        
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        
+        git add .
+        
+        if ! git diff --staged --quiet; then
+          git commit -m "🚀 Update app-javdes image to build ${{ github.run_number }}
+          
+          - Image: ${{ secrets.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}
+          - Commit: ${{ github.sha }}
+          - Workflow: ${{ github.workflow }}
+          - Actor: ${{ github.actor }}"
+          
+          git push origin main
+          echo "✅ Manifest changes pushed successfully!"
+        else
+          echo "ℹ️ No changes to commit"
+        fi
+        
+  deploy:
+    name: Deploy to Kubernetes
+    needs: update-manifests
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    environment: production
+    
+    steps:
+    - name: Checkout Manifests Repository
+      uses: actions/checkout@v4
+      with:
+        repository: Golge/app-fatih-manifests
+        token: ${{ secrets.GHUB_TOKEN }}
+        path: manifests
+        
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+        
+    - name: Configure kubectl
+      run: |
+        if [ ! -z "${{ secrets.KUBE_CONFIG_DATA }}" ]; then
+          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          
+          # Test connection
+          kubectl cluster-info
+          kubectl get nodes
+        else
+          echo "⚠️ KUBE_CONFIG_DATA not provided - skipping direct deployment"
+          echo "📋 Manifests have been updated and are ready for ArgoCD"
+          exit 0
+        fi
+        
+    - name: Deploy to Kubernetes
+      run: |
+        cd manifests
+        
+        if [ -d "k8s-manifests/app/base" ]; then
+          echo "🚀 Applying Kubernetes manifests..."
+          kubectl apply -f k8s-manifests/app/base/
+          
+          echo "⏳ Waiting for deployment to be ready..."
+          kubectl rollout status deployment/app-javdes --timeout=300s
+          
+          echo "✅ Deployment successful!"
+          kubectl get pods -l app=app-javdes
+          kubectl get svc -l app=app-javdes
+        else
+          echo "❌ Manifests directory not found"
+          exit 1
+        fi
+        
+    - name: Post-deployment verification
+      run: |
+        echo "🔍 Verifying deployment..."
+        kubectl get deployment app-javdes -o wide
+        kubectl describe deployment app-javdes
+        
+        # Check if pods are ready
+        kubectl wait --for=condition=ready pod -l app=app-javdes --timeout=300s
+        
+        echo "✅ Deployment verification completed!"
+        
+  notification:
+    name: Notification
+    needs: [build-and-test, sonarqube-analysis, build-and-push-image, security-scan, update-manifests, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Notify Success
+      if: ${{ needs.build-and-test.result == 'success' && needs.sonarqube-analysis.result == 'success' && needs.build-and-push-image.result == 'success' }}
+      run: |
+        echo "🎉 CI/CD Pipeline completed successfully!"
+        echo "📦 Image: ${{ secrets.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}"
+        echo "🔗 Harbor: http://${{ secrets.HARBOR_REGISTRY }}/harbor/projects"
+        echo "📋 Manifests updated in app-fatih-manifests repository"
+        echo "🚀 Application deployed to Kubernetes"
+        
+    - name: Notify Failure
+      if: ${{ needs.build-and-test.result == 'failure' || needs.sonarqube-analysis.result == 'failure' || needs.build-and-push-image.result == 'failure' }}
+      run: |
+        echo "💥 CI/CD Pipeline failed!"
+        echo "🔍 Check the logs for details"
+        echo "📋 Build: ${{ needs.build-and-test.result }}"
+        echo "📋 SonarQube: ${{ needs.sonarqube-analysis.result }}"
+        echo "📋 Docker: ${{ needs.build-and-push-image.result }}"
