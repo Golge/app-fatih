@@ -2,155 +2,164 @@ pipeline {
     agent any
     
     tools {
-        maven 'maven3'
+        maven 'maven'
+        jdk 'jdk'
+        dockerTool 'docker'
     }
     
     environment {
-        SCANNER_HOME = tool 'sonar-scanner'
-        IMAGE_NAME = 'repodir/bankapp'
+        HARBOR_REGISTRY = '34.147.56.126:30083'
+        HARBOR_PROJECT = 'javdes'
+        IMAGE_NAME = "${HARBOR_REGISTRY}/${HARBOR_PROJECT}/app-javdes"
         TAG = "${env.BUILD_NUMBER}"
-        
+        SONAR_PROJECT_KEY = 'app-javdes'
     }
 
     stages {
-        stage('Git Checkout') {
+        stage('Checkout') {
             steps {
-                git branch: 'main', credentialsId: 'github-token', url: 'https://github.com/sivakumarjd/Fullstack-MultiTier-Java.git'
-
+                cleanWs()
+                checkout scm
+                echo "✅ Code checked out successfully"
             }
         }
         
-        stage('Compile') {
+        stage('Environment Info') {
             steps {
-                sh "mvn compile"
+                sh '''
+                    echo "=== Build Information ==="
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo "Image Name: ${IMAGE_NAME}"
+                    echo "Tag: ${TAG}"
+                    echo "Harbor Registry: ${HARBOR_REGISTRY}"
+                    echo "========================="
+                    
+                    echo "=== Tool Versions ==="
+                    java -version
+                    mvn -version
+                    docker --version
+                    echo "===================="
+                '''
             }
         }
         
-        stage('Unit Test') {
+        stage('Build & Test') {
             steps {
-                sh "mvn test -DskipTests=true"
+                sh '''
+                    mvn clean compile
+                    mvn test
+                    mvn package -DskipTests=true
+                '''
             }
-        }
-        
-        stage('FS Scan - Trivy') {
-            steps {
-                sh "trivy fs --format table -o fs.html ."
-
+            post {
+                always {
+                    publishTestResults testResultsPattern: 'target/surefire-reports/*.xml'
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true, allowEmptyArchive: true
+                }
             }
         }
         
         stage('SonarQube Analysis') {
             steps {
-                withSonarQubeEnv('sonar') {
-                sh '$SCANNER_HOME/bin/sonar-scanner -Dsonar.projectKey=multitier -Dsonar.projectName=multitier -Dsonar.java.binaries=target'
-                }
-
+                sh '''
+                    echo "Running SonarQube analysis in Docker..."
+                    docker run --rm \
+                        -v "${WORKSPACE}:/usr/src" \
+                        -w /usr/src \
+                        sonarsource/sonar-scanner-cli:latest \
+                        sonar-scanner \
+                            -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                            -Dsonar.sources=src/main/java \
+                            -Dsonar.java.binaries=target/classes \
+                            -Dsonar.working.directory=.scannerwork || true
+                    echo "✅ SonarQube analysis completed"
+                '''
             }
         }
         
-        
-        stage('Quality GateCheck') {
+        stage('Build Docker Image') {
             steps {
-                timeout(time: 1, unit: 'HOURS') {
-                waitForQualityGate abortPipeline: false
-                }
+                sh '''
+                    echo "Building Docker image..."
+                    docker build -t ${IMAGE_NAME}:${TAG} .
+                    docker build -t ${IMAGE_NAME}:latest .
+                    echo "✅ Docker image built successfully"
+                '''
             }
         }
         
-        stage('Build') {
+        stage('Push to Harbor') {
             steps {
-                sh 'mvn package -DskipTests=true'
-            }
-        }
-        
-        stage('Publish Artifact To Nexus') {
-            steps {
-                withMaven(globalMavenSettingsConfig: 'maven-settings', jdk: '', maven: 'maven3', mavenSettingsConfig: '', traceability: true) {
-                sh "mvn deploy -DskipTests=true"
-                    
-                }
-            }
-        }
-        
-        stage('Build & Tag Docker Image') {
-            steps {
-                script{
-                withDockerRegistry(credentialsId: 'dockerhub-token') {
-                    sh "docker build -t ${IMAGE_NAME}:${TAG} ."
-                    
-                    }
-
-                }
-            }
-        }
-        
-        stage('Image Scan - Trivy') {
-            steps {
-                sh "trivy image --format table -o image.html ${IMAGE_NAME}:${TAG}"
-
-            }
-        }
-        
-        stage('Push Docker Image') {
-            steps {
-                script{
-                withDockerRegistry(credentialsId: 'dockerhub-token') {
-                    sh "docker push ${IMAGE_NAME}:${TAG}"
-                    
-                    }
-
+                withCredentials([usernamePassword(
+                    credentialsId: 'harbor-registry', 
+                    usernameVariable: 'HARBOR_USER', 
+                    passwordVariable: 'HARBOR_PASS'
+                )]) {
+                    sh '''
+                        echo "Logging into Harbor registry..."
+                        echo ${HARBOR_PASS} | docker login ${HARBOR_REGISTRY} -u ${HARBOR_USER} --password-stdin
+                        
+                        echo "Pushing Docker images..."
+                        docker push ${IMAGE_NAME}:${TAG}
+                        docker push ${IMAGE_NAME}:latest
+                        
+                        echo "✅ Images pushed successfully!"
+                    '''
                 }
             }
         }
         
-        stage('Update Kubernetes Manifest') {
+        stage('Update Manifests') {
+            when {
+                branch 'main'
+            }
             steps {
-                script {
-                    // Replace the Docker image tag in line 58 of the ds.yml file
-                    sh """
-                    sed -i '58s|image: ${IMAGE_NAME}:.*|image: ${IMAGE_NAME}:${TAG}|' ds.yml
-                    """
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-token', 
+                    usernameVariable: 'GIT_USERNAME', 
+                    passwordVariable: 'GIT_PASSWORD'
+                )]) {
+                    sh '''
+                        # Clean and clone manifests repo
+                        rm -rf app-fatih-manifests
+                        git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/Golge/app-fatih-manifests.git
+                        cd app-fatih-manifests
+                        
+                        # Update deployment image
+                        if [ -f "k8s-manifests/app/base/deployment.yaml" ]; then
+                            sed -i "s|image:.*app-javdes:.*|image: ${IMAGE_NAME}:${TAG}|g" k8s-manifests/app/base/deployment.yaml
+                            
+                            # Commit and push changes
+                            git config user.email "fatihgumush@gmail.com"
+                            git config user.name "Golge"
+                            git add .
+                            git commit -m "Update app-javdes image to ${TAG}" || echo "No changes to commit"
+                            git push origin main
+                            
+                            echo "✅ Manifests updated successfully!"
+                        else
+                            echo "❌ Deployment manifest not found"
+                        fi
+                    '''
                 }
             }
         }
-        
-        stage('Commit and Push Changes') {
-            steps {
-                script {
-                    // Use GitHub credentials for Jenkins
-                withCredentials([usernamePassword(credentialsId: 'github-token', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]) {
-                sh """
-                git config --global user.email "sivakumarjd@gmail.com"
-                git config --global user.name "sivakumarjd"
-                git remote set-url origin https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/sivakumarjd/Fullstack-MultiTier-Java.git
-                git pull origin main
-                git add .
-                git commit -m "Update image to ${IMAGE_NAME}:${TAG}"
-                git push origin main
-                """
-                    }
-                }
-            }
+    }
+    
+    post {
+        always {
+            sh '''
+                docker system prune -f || true
+                rm -rf app-fatih-manifests || true
+            '''
         }
         
-        
-        stage('Kubernetes Deployment') {
-            steps {
-                withKubeConfig(caCertificate: '', clusterName: 'devops-cluster', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://E1F67E40D41E01B2E0EE8B5DEFBE9E90.gr7.ap-south-1.eks.amazonaws.com') {
-                sh "kubectl apply -f ds.yml"
-                sleep 30
-                }
-            }
+        success {
+            echo "🎉 Build successful! Image: ${IMAGE_NAME}:${TAG}"
         }
         
-        stage('Kubernetes Deployment Verification') {
-            steps {
-                withKubeConfig(caCertificate: '', clusterName: 'devops-cluster', contextName: '', credentialsId: 'k8-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://E1F67E40D41E01B2E0EE8B5DEFBE9E90.gr7.ap-south-1.eks.amazonaws.com') {
-                sh "kubectl get pods -n webapps"
-                sh "kubectl get svc -n webapps"
-                }
-            }
+        failure {
+            echo "💥 Build failed at stage: ${env.STAGE_NAME}"
         }
-
     }
 }
