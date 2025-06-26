@@ -86,7 +86,7 @@ jobs:
 
     - name: Login to Harbor
       run: |
-        echo "${{ secrets.HARBOR_PASSWORD }}" | docker login ${{ env.HARBOR_REGISTRY }} -u ${{ secrets.HARBOR_USERNAME }} --password-stdin
+        echo "Harbor12345" | docker login ${{ env.HARBOR_REGISTRY }} -u admin --password-stdin
 
     - name: Build and push Docker image
       run: |
