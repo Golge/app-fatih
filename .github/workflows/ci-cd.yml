@@ -7,7 +7,7 @@ on:
     branches: [ main, dev ]
 
 env:
-  HARBOR_REGISTRY: 34.32.141.92:30083
+  HARBOR_REGISTRY: harbor.local:30083
   HARBOR_PROJECT: javdes
   IMAGE_NAME: bankapp
 
@@ -44,65 +44,8 @@ jobs:
         name: jar-artifact
         path: target/*.jar
 
-build-and-push-image:
-  needs: build-and-test
-  runs-on: ubuntu-latest
-  if: github.event_name == 'push'
-
-  outputs:
-    image-tag: ${{ steps.image-tag.outputs.tag }}
-
-  steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Download build artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: jar-artifact
-        path: target/
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-      with:
-        buildkitd-flags: --allow-insecure-entitlement security.insecure
-
-    - name: Generate image tag
-      id: image-tag
-      run: |
-        if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-          echo "tag=prod-${GITHUB_SHA:0:7}" >> $GITHUB_OUTPUT
-        else
-          echo "tag=dev-${GITHUB_SHA:0:7}" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Login to Harbor
-      run: |
-        echo "Attempting to login to Harbor registry..."
-        echo "Harbor12345" | docker login ${{ env.HARBOR_REGISTRY }} -u admin --password-stdin
-
-    - name: Build and push Docker image using Buildx
-      run: |
-        IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
-        FULL_IMAGE_NAME="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}"
-
-        echo "Building and pushing image: ${FULL_IMAGE_NAME}:${IMAGE_TAG}"
-
-        docker buildx build \
-          --tag "${FULL_IMAGE_NAME}:${IMAGE_TAG}" \
-          --tag "${FULL_IMAGE_NAME}:latest" \
-          --push \
-          --allow security.insecure \
-          --output=type=image \
-          .
-
-    - name: Test Harbor registry connectivity (optional)
-      run: |
-        echo "Testing Harbor API..."
-        curl -f -m 30 http://${{ env.HARBOR_REGISTRY }}/api/v2.0/systeminfo || echo "Warning: Harbor API not reachable, continuing anyway."
-  
-  deploy:
-    needs: build-and-push-image
+  build-and-push-image:
+    needs: build-and-test
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     
@@ -112,57 +55,27 @@ build-and-push-image:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+
     - name: Download build artifacts
       uses: actions/download-artifact@v4
       with:
         name: jar-artifact
         path: target/
-        
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-      with:
-        driver: docker-container
-        config-inline: |
-          [registry."34.32.141.92:30083"]
-            http = true
-            insecure = true
-            
+      
     - name: Configure Docker for insecure registry
       run: |
-        # Create docker directory
-        sudo mkdir -p /etc/docker
-        
-        # Configure Docker daemon for insecure registry with IP address only
-        echo '{
-          "insecure-registries": ["34.32.141.92:30083"],
-          "registry-mirrors": [],
-          "hosts": ["fd://", "tcp://0.0.0.0:2376"]
-        }' | sudo tee /etc/docker/daemon.json
-        
-        # Also add to /etc/hosts to prevent any DNS resolution issues
+        # Add hostname mapping for Harbor
         echo "34.32.141.92 harbor.local" | sudo tee -a /etc/hosts
         
-        # Restart Docker service
+        # Configure Docker daemon for insecure registry
+        sudo mkdir -p /etc/docker
+        echo '{"insecure-registries":["harbor.local:30083", "34.32.141.92:30083"]}' | sudo tee /etc/docker/daemon.json
         sudo systemctl restart docker
-        
-        # Wait for Docker to be ready
-        sleep 20
-        
-        # Verify Docker is running
-        sudo systemctl status docker --no-pager -l
-        
-        # Test that Docker can reach the registry
-        echo "Testing Docker connectivity to registry..."
-        docker pull hello-world || true
-        
-    - name: Test Docker configuration
-      run: |
-        docker info
-        docker version
-        echo "Testing connectivity to Harbor..."
-        curl -v http://34.32.141.92:30083/api/v2.0/systeminfo || true
-      
+        sleep 10
+
     - name: Generate image tag
       id: image-tag
       run: |
@@ -171,56 +84,28 @@ build-and-push-image:
         else
           echo "tag=dev-${GITHUB_SHA:0:7}" >> $GITHUB_OUTPUT
         fi
-        
+
     - name: Login to Harbor
       run: |
-        echo "Attempting to login to Harbor registry..."
-        echo "Registry: 34.32.141.92:30083"
-        echo "Username: admin"
-        
-        # Test network connectivity first
-        echo "Testing network connectivity..."
-        ping -c 3 34.32.141.92 || true
-        
-        # Test if we can reach Harbor HTTP endpoint
-        echo "Testing Harbor HTTP endpoint..."
-        curl -v -m 30 http://34.32.141.92:30083/ || true
-        
-        # Test Harbor API
-        echo "Testing Harbor API..."
-        curl -f -m 30 http://34.32.141.92:30083/api/v2.0/systeminfo || {
-          echo "Harbor API is not accessible, but continuing..."
-        }
-        
-        # Set explicit registry URL without any hostname
-        REGISTRY_URL="34.32.141.92:30083"
-        
-        # Attempt Docker login with explicit IP
-        echo "Attempting Docker login..."
-        echo "Harbor12345" | docker login "$REGISTRY_URL" -u admin --password-stdin
-        
-        echo "Login successful to $REGISTRY_URL!"
-        
+        echo "Harbor12345" | docker login ${{ env.HARBOR_REGISTRY }} -u admin --password-stdin
+
     - name: Build and push Docker image
       run: |
         IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
         FULL_IMAGE_NAME="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}"
         
-        echo "Building Docker image..."
-        echo "Image: ${FULL_IMAGE_NAME}:${IMAGE_TAG}"
-        
         # Build the image
         docker build -t "${FULL_IMAGE_NAME}:${IMAGE_TAG}" .
         docker tag "${FULL_IMAGE_NAME}:${IMAGE_TAG}" "${FULL_IMAGE_NAME}:latest"
         
-        echo "Pushing Docker image..."
+        # Push the image
         docker push "${FULL_IMAGE_NAME}:${IMAGE_TAG}"
         docker push "${FULL_IMAGE_NAME}:latest"
-        
-        echo "Image pushed successfully!"
-        echo "Tags pushed:"
-        echo "- ${FULL_IMAGE_NAME}:${IMAGE_TAG}"
-        echo "- ${FULL_IMAGE_NAME}:latest"
+
+    - name: Test Harbor registry connectivity (optional)
+      run: |
+        echo "Testing Harbor API..."
+        curl -f -m 30 http://harbor.local:30083/api/v2.0/systeminfo || echo "Warning: Harbor API not reachable, continuing anyway."
 
   deploy:
     needs: build-and-push-image
