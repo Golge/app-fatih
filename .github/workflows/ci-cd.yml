@@ -128,37 +128,21 @@ jobs:
         fi
         
         echo "Updating image tag for ${NAMESPACE} environment..."
-        echo "Current working directory: $(pwd)"
-        echo "Looking for file: k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml"
-        
-        # List all files to debug
-        echo "Available files in manifests directory:"
-        ls -la
-        echo "Available files in k8s-manifests:"
-        ls -la k8s-manifests/ || echo "k8s-manifests directory not found"
-        echo "Available files in k8s-manifests/app:"
-        ls -la k8s-manifests/app/ || echo "k8s-manifests/app directory not found"
-        echo "Available files in k8s-manifests/app/overlays:"
-        ls -la k8s-manifests/app/overlays/ || echo "k8s-manifests/app/overlays directory not found"
-        echo "Available files in k8s-manifests/app/overlays/${NAMESPACE}:"
-        ls -la k8s-manifests/app/overlays/${NAMESPACE}/ || echo "k8s-manifests/app/overlays/${NAMESPACE} directory not found"
+        echo "Looking for file: k8s-manifests/app/overlays/${NAMESPACE}/deployment-patch.yaml"
         
         # Check if file exists
-        if [ -f "k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml" ]; then
+        if [ -f "k8s-manifests/app/overlays/${NAMESPACE}/deployment-patch.yaml" ]; then
           echo "File found, updating image tag..."
-          echo "Original content:"
-          cat k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml
-          
-          # Update the image tag in the appropriate overlay
+          # Update the image tag in the appropriate overlay patch
           sed -i "s|image: .*bankapp:.*|image: 34.32.141.92:30083/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push-image.outputs.image-tag }}|g" \
-            k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml
+            k8s-manifests/app/overlays/${NAMESPACE}/deployment-patch.yaml
           echo "Image tag updated successfully!"
           echo "New content:"
-          cat k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml
+          cat k8s-manifests/app/overlays/${NAMESPACE}/deployment-patch.yaml
         else
-          echo "ERROR: File not found!"
-          echo "Trying alternative paths..."
-          find . -name "deployment.yaml" -type f || echo "No deployment.yaml files found"
+          echo "ERROR: deployment-patch.yaml not found!"
+          echo "Available files:"
+          find k8s-manifests/app/overlays/${NAMESPACE}/ -name "*.yaml" || true
           exit 1
         fi
           
