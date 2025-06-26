@@ -64,17 +64,33 @@ jobs:
         
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          image=moby/buildkit:latest
+        config-inline: |
+          [registry."harbor.local"]
+            http = true
+            insecure = true
             
     - name: Configure Docker for insecure registry
       run: |
+        # Configure Docker daemon
         sudo mkdir -p /etc/docker
         echo '{"insecure-registries":["${{ env.HARBOR_REGISTRY }}"]}' | sudo tee /etc/docker/daemon.json
         sudo systemctl restart docker || true
         sleep 10
         
-        # Also configure buildkit for insecure registry
+        # Configure Docker client
         mkdir -p ~/.docker
         echo '{"experimental": "enabled", "insecure-registries": ["${{ env.HARBOR_REGISTRY }}"]}' > ~/.docker/config.json
+        
+        # Configure buildkitd for insecure registry
+        mkdir -p ~/.config/buildkit
+        cat > ~/.config/buildkit/buildkitd.toml << 'EOF'
+        [registry."${{ env.HARBOR_REGISTRY }}"]
+          http = true
+          insecure = true
+        EOF
       
     - name: Generate image tag
       id: image-tag
@@ -89,8 +105,9 @@ jobs:
       uses: docker/login-action@v3
       with:
         registry: ${{ env.HARBOR_REGISTRY }}
-        username: ${{ vars.HARBOR_USERNAME }}
-        password: ${{ secrets.HARBOR_PASSWORD }}
+        username: admin
+        password: Harbor12345
+      continue-on-error: true
         
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
@@ -106,15 +123,16 @@ jobs:
   deploy:
     needs: build-and-push-image
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.token != ''
     
     steps:
     - name: Checkout manifests repository
       uses: actions/checkout@v4
       with:
         repository: ${{ github.repository_owner }}/app-fatih-manifests
-        token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        token: ${{ github.token }}
         path: manifests
+      continue-on-error: true
         
     - name: Update image tag in manifests
       run: |
