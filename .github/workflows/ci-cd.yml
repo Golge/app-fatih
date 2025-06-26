@@ -105,9 +105,8 @@ jobs:
       uses: docker/login-action@v3
       with:
         registry: ${{ env.HARBOR_REGISTRY }}
-        username: admin
-        password: Harbor12345
-      continue-on-error: true
+        username: ${{ vars.HARBOR_USERNAME }}
+        password: ${{ secrets.HARBOR_PASSWORD }}
         
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
