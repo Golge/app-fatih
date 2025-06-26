@@ -33,10 +33,10 @@ jobs:
         restore-keys: ${{ runner.os }}-m2
         
     - name: Run tests
-      run: ./mvnw clean test
+      run: mvn clean test
       
     - name: Build application
-      run: ./mvnw clean package -DskipTests
+      run: mvn clean package -DskipTests
       
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
