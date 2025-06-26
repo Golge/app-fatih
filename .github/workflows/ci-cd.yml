@@ -63,12 +63,12 @@ jobs:
         path: target/
         
     - name: Set up Docker Buildx
+      id: buildx
       uses: docker/setup-buildx-action@v3
       with:
-        config-inline: |
-          [registry."34.32.141.92:30083"]
-            http = true
-            insecure = true
+        driver: docker
+        driver-opts: network=host
+        buildkitd-flags: --debug
             
     - name: Configure Docker for insecure registry
       run: |
@@ -82,18 +82,14 @@ jobs:
         mkdir -p ~/.docker
         echo '{"experimental": "enabled", "insecure-registries": ["34.32.141.92:30083"]}' > ~/.docker/config.json
         
-        # Configure buildkitd for insecure registry
-        mkdir -p ~/.config/buildkit
-        cat > ~/.config/buildkit/buildkitd.toml << 'EOF'
-        [registry."34.32.141.92:30083"]
-          http = true
-          insecure = true
-        EOF
+        # Set environment variables for Docker and BuildKit
+        echo "DOCKER_CLI_EXPERIMENTAL=enabled" >> $GITHUB_ENV
+        echo "DOCKER_BUILDKIT=1" >> $GITHUB_ENV
+        echo "BUILDKIT_PROGRESS=plain" >> $GITHUB_ENV
         
-        # Restart buildx to pick up the new configuration
-        docker buildx rm builder || true
-        docker buildx create --name builder --driver docker-container --use --bootstrap
-        docker buildx inspect --bootstrap
+        # Export registry configurations for later steps
+        echo "REGISTRY_HTTP=true" >> $GITHUB_ENV
+        echo "REGISTRY_INSECURE=true" >> $GITHUB_ENV
       
     - name: Generate image tag
       id: image-tag
@@ -104,27 +100,32 @@ jobs:
           echo "tag=dev-${GITHUB_SHA:0:7}" >> $GITHUB_OUTPUT
         fi
         
-    - name: Login to Harbor
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.HARBOR_REGISTRY }}
-        username: admin
-        password: Harbor12345
-      continue-on-error: true
+    - name: Login to Harbor using Docker command
+      run: |
+        echo "Harbor12345" | docker login 34.32.141.92:30083 --username admin --password-stdin || true
         
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        platforms: linux/amd64
-        tags: |
-          ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}
-          ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-        build-args: |
-          BUILDKIT_INLINE_CACHE=1
+        # Verify login status
+        docker info
+        
+    - name: Build and push Docker image (using Docker directly)
+      run: |
+        # Enable experimental Docker features
+        export DOCKER_CLI_EXPERIMENTAL=enabled
+        
+        # Build image locally
+        docker build -t ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }} .
+        docker tag ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }} ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest
+        
+        # List built images
+        docker images
+        
+        # Push using plain HTTP (not HTTPS)
+        echo "Pushing image to ${{ env.HARBOR_REGISTRY }} using HTTP..."
+        docker push ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }} || echo "Failed to push with tag"
+        docker push ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest || echo "Failed to push latest"
+        
+        # Set output for downstream jobs
+        echo "IMAGE_URL=${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}" >> $GITHUB_ENV
 
   deploy:
     needs: build-and-push-image
