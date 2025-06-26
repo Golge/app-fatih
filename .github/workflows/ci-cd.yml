@@ -49,6 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     
+    environment: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+    
     outputs:
       image-tag: ${{ steps.image-tag.outputs.tag }}
       
@@ -84,7 +86,7 @@ jobs:
 
     - name: Login to Harbor
       run: |
-        echo "Harbor12345" | docker login ${{ env.HARBOR_REGISTRY }} -u admin --password-stdin
+        echo "${{ secrets.HARBOR_PASSWORD }}" | docker login ${{ env.HARBOR_REGISTRY }} -u ${{ secrets.HARBOR_USERNAME }} --password-stdin
 
     - name: Build and push Docker image
       run: |
@@ -108,6 +110,8 @@ jobs:
     needs: build-and-push-image
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
+    
+    environment: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
     
     steps:
     - name: Checkout manifests repository
