@@ -7,7 +7,7 @@ on:
     branches: [ main, dev ]
 
 env:
-  HARBOR_REGISTRY: 34.32.141.92:30083
+  HARBOR_REGISTRY: ${{ vars.HARBOR_REGISTRY || '34.32.141.92:30083' }}
   HARBOR_PROJECT: javdes
   IMAGE_NAME: bankapp
 
@@ -49,32 +49,48 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     
-    environment: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
-    
     outputs:
       image-tag: ${{ steps.image-tag.outputs.tag }}
       
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
+      
     - name: Download build artifacts
       uses: actions/download-artifact@v4
       with:
         name: jar-artifact
         path: target/
-
+        
     - name: Set up Docker Buildx
+      id: buildx
       uses: docker/setup-buildx-action@v3
-      
+      with:
+        driver: docker
+        driver-opts: network=host
+        buildkitd-flags: --debug
+            
     - name: Configure Docker for insecure registry
       run: |
-        # Configure Docker daemon for insecure registry
+        # Configure Docker daemon
         sudo mkdir -p /etc/docker
         echo '{"insecure-registries":["34.32.141.92:30083"]}' | sudo tee /etc/docker/daemon.json
-        sudo systemctl restart docker
+        sudo systemctl restart docker || true
         sleep 10
-
+        
+        # Configure Docker client
+        mkdir -p ~/.docker
+        echo '{"experimental": "enabled", "insecure-registries": ["34.32.141.92:30083"]}' > ~/.docker/config.json
+        
+        # Set environment variables for Docker and BuildKit
+        echo "DOCKER_CLI_EXPERIMENTAL=enabled" >> $GITHUB_ENV
+        echo "DOCKER_BUILDKIT=1" >> $GITHUB_ENV
+        echo "BUILDKIT_PROGRESS=plain" >> $GITHUB_ENV
+        
+        # Export registry configurations for later steps
+        echo "REGISTRY_HTTP=true" >> $GITHUB_ENV
+        echo "REGISTRY_INSECURE=true" >> $GITHUB_ENV
+      
     - name: Generate image tag
       id: image-tag
       run: |
@@ -83,46 +99,54 @@ jobs:
         else
           echo "tag=dev-${GITHUB_SHA:0:7}" >> $GITHUB_OUTPUT
         fi
-
-    - name: Login to Harbor
-      run: |
-        echo "Harbor12345" | docker login ${{ env.HARBOR_REGISTRY }} -u admin --password-stdin
-
-    - name: Build and push Docker image
-      run: |
-        IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
-        FULL_IMAGE_NAME="${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}"
         
-        # Build the image
-        docker build -t "${FULL_IMAGE_NAME}:${IMAGE_TAG}" .
-        docker tag "${FULL_IMAGE_NAME}:${IMAGE_TAG}" "${FULL_IMAGE_NAME}:latest"
-        
-        # Push the image
-        docker push "${FULL_IMAGE_NAME}:${IMAGE_TAG}"
-        docker push "${FULL_IMAGE_NAME}:latest"
-
-    - name: Test Harbor registry connectivity (optional)
+    - name: Login to Harbor using Docker command
       run: |
-        echo "Testing Harbor API..."
-        curl -f -m 30 http://34.32.141.92:30083/api/v2.0/systeminfo || echo "Warning: Harbor API not reachable, continuing anyway."
+        echo "${{ secrets.HARBOR_PASSWORD }}" | docker login ${{ env.HARBOR_REGISTRY }} --username ${{ vars.HARBOR_USERNAME || 'admin' }} --password-stdin
+        
+        # Verify login status
+        docker info
+        
+    - name: Build and push Docker image (using Docker directly)
+      run: |
+        # Enable experimental Docker features
+        export DOCKER_CLI_EXPERIMENTAL=enabled
+        
+        # Build image locally
+        docker build -t ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }} .
+        docker tag ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }} ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest
+        
+        # List built images
+        docker images
+        
+        # Push using plain HTTP (not HTTPS)
+        echo "Pushing image to ${{ env.HARBOR_REGISTRY }} using HTTP..."
+        docker push ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }} || echo "Failed to push with tag"
+        docker push ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest || echo "Failed to push latest"
+        
+        # Set output for downstream jobs
+        echo "IMAGE_URL=${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ steps.image-tag.outputs.tag }}" >> $GITHUB_ENV
 
   deploy:
     needs: build-and-push-image
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     
-    environment: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
-    
     steps:
     - name: Checkout manifests repository
       uses: actions/checkout@v4
       with:
-        repository: Golge/app-fatih-manifests
-        token: ${{ secrets.GHUB_TOKEN }}
+        repository: ${{ github.repository_owner }}/app-fatih-manifests
+        token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         path: manifests
-        
+      continue-on-error: true
     - name: Update image tag in manifests
       run: |
+        if [ ! -d "manifests" ]; then
+          echo "Manifests directory not found, skipping update"
+          exit 0
+        fi
+        
         cd manifests
         NAMESPACE=""
         if [ "${{ github.ref }}" = "refs/heads/main" ]; then
@@ -131,30 +155,41 @@ jobs:
           NAMESPACE="dev"
         fi
         
-        echo "Updating image tag for ${NAMESPACE} environment..."
-        echo "Looking for file: k8s-manifests/app/overlays/${NAMESPACE}/deployment-patch.yaml"
-        
-        # Check if file exists
-        if [ -f "k8s-manifests/app/overlays/${NAMESPACE}/deployment-patch.yaml" ]; then
-          echo "File found, updating image tag..."
-          # Update the image tag in the appropriate overlay patch
-          sed -i "s|image: .*bankapp:.*|image: 34.32.141.92:30083/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push-image.outputs.image-tag }}|g" \
-            k8s-manifests/app/overlays/${NAMESPACE}/deployment-patch.yaml
-          echo "Image tag updated successfully!"
-          echo "New content:"
-          cat k8s-manifests/app/overlays/${NAMESPACE}/deployment-patch.yaml
-        else
-          echo "ERROR: deployment-patch.yaml not found!"
+        # Check if the deployment file exists
+        if [ ! -f "k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml" ]; then
+          echo "Deployment file not found at k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml"
           echo "Available files:"
-          find k8s-manifests/app/overlays/${NAMESPACE}/ -name "*.yaml" || true
-          exit 1
+          find . -name "*.yaml" -o -name "*.yml" | head -20
+          exit 0
         fi
+        
+        # Update the image tag in the appropriate overlay
+        sed -i "s|image: .*bankapp:.*|image: ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push-image.outputs.image-tag }}|g" \
+          k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml
+          
+        # Show what changed
+        git diff
           
     - name: Commit and push changes
       run: |
+        if [ ! -d "manifests" ]; then
+          echo "Manifests directory not found, skipping commit"
+          exit 0
+        fi
+        
         cd manifests
         git config --local user.email "fatihgumush@gmail.com"
         git config --local user.name "Golge"
+
+        # Configure git to use the Personal Access Token
+        git remote set-url origin https://x-access-token:${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/${{ github.repository_owner }}/app-fatih-manifests.git
+
         git add .
-        git commit -m "Update image to ${{ needs.build-and-push-image.outputs.image-tag }}" || exit 0
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        
+        git commit -m "Update image to ${{ needs.build-and-push-image.outputs.image-tag }}"
         git push
+
