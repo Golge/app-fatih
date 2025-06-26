@@ -127,9 +127,23 @@ jobs:
           NAMESPACE="dev"
         fi
         
-        # Update the image tag in the appropriate overlay
-        sed -i "s|image: .*bankapp:.*|image: ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push-image.outputs.image-tag }}|g" \
-          k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml
+        echo "Updating image tag for ${NAMESPACE} environment..."
+        echo "Looking for file: k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml"
+        
+        # Check if file exists
+        if [ -f "k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml" ]; then
+          echo "File found, updating image tag..."
+          # Update the image tag in the appropriate overlay
+          sed -i "s|image: .*bankapp:.*|image: 34.32.141.92:30083/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push-image.outputs.image-tag }}|g" \
+            k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml
+          echo "Image tag updated successfully!"
+          echo "New content:"
+          cat k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml
+        else
+          echo "ERROR: File not found!"
+          echo "Available files:"
+          find k8s-manifests/app/overlays/${NAMESPACE}/ -name "*.yaml" || true
+        fi
           
     - name: Commit and push changes
       run: |
