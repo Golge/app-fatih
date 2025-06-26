@@ -160,6 +160,11 @@ jobs:
         cd manifests
         git config --local user.email "fatihgumush@gmail.com"
         git config --local user.name "Golge"
+
+        # Inject PAT into remote URL for push
+        git remote set-url origin https://x-access-token:${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/${{ github.repository_owner }}/app-fatih-manifests.git
+
         git add .
         git commit -m "Update image to ${{ needs.build-and-push-image.outputs.image-tag }}" || exit 0
         git push
+
