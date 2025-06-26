@@ -7,7 +7,7 @@ on:
     branches: [ main, dev ]
 
 env:
-  HARBOR_REGISTRY: http://34.32.141.92:30083
+  HARBOR_REGISTRY: 34.32.141.92:30083
   HARBOR_PROJECT: javdes
   IMAGE_NAME: bankapp
 
