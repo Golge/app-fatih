@@ -7,7 +7,7 @@ on:
     branches: [ main, dev ]
 
 env:
-  HARBOR_REGISTRY: 34.32.141.92:30083
+  HARBOR_REGISTRY: ${{ vars.HARBOR_REGISTRY || '34.32.141.92:30083' }}
   HARBOR_PROJECT: javdes
   IMAGE_NAME: bankapp
 
@@ -102,7 +102,7 @@ jobs:
         
     - name: Login to Harbor using Docker command
       run: |
-        echo "Harbor12345" | docker login 34.32.141.92:30083 --username admin --password-stdin || true
+        echo "${{ secrets.HARBOR_PASSWORD }}" | docker login ${{ env.HARBOR_REGISTRY }} --username ${{ vars.HARBOR_USERNAME || 'admin' }} --password-stdin
         
         # Verify login status
         docker info
@@ -140,9 +140,13 @@ jobs:
         token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         path: manifests
       continue-on-error: true
-        
     - name: Update image tag in manifests
       run: |
+        if [ ! -d "manifests" ]; then
+          echo "Manifests directory not found, skipping update"
+          exit 0
+        fi
+        
         cd manifests
         NAMESPACE=""
         if [ "${{ github.ref }}" = "refs/heads/main" ]; then
@@ -151,20 +155,41 @@ jobs:
           NAMESPACE="dev"
         fi
         
+        # Check if the deployment file exists
+        if [ ! -f "k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml" ]; then
+          echo "Deployment file not found at k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml"
+          echo "Available files:"
+          find . -name "*.yaml" -o -name "*.yml" | head -20
+          exit 0
+        fi
+        
         # Update the image tag in the appropriate overlay
         sed -i "s|image: .*bankapp:.*|image: ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push-image.outputs.image-tag }}|g" \
           k8s-manifests/app/overlays/${NAMESPACE}/deployment.yaml
           
+        # Show what changed
+        git diff
+          
     - name: Commit and push changes
       run: |
+        if [ ! -d "manifests" ]; then
+          echo "Manifests directory not found, skipping commit"
+          exit 0
+        fi
+        
         cd manifests
         git config --local user.email "fatihgumush@gmail.com"
         git config --local user.name "Golge"
 
-        # Inject PAT into remote URL for push
+        # Configure git to use the Personal Access Token
         git remote set-url origin https://x-access-token:${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/${{ github.repository_owner }}/app-fatih-manifests.git
 
         git add .
-        git commit -m "Update image to ${{ needs.build-and-push-image.outputs.image-tag }}" || exit 0
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        
+        git commit -m "Update image to ${{ needs.build-and-push-image.outputs.image-tag }}"
         git push
 
